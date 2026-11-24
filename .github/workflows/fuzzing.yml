@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   ffuf:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     services:
       juice:
         image: bkimminich/juice-shop
@@ -20,6 +20,9 @@ jobs:
           - 3000:3000
 
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Wait for service
         run: |
           echo "Waiting for Juice Shop to start..."
@@ -30,33 +33,29 @@ jobs:
             fi
             sleep 2
           done
-          # Дополнительная проверка, что эндпоинт отвечает на POST
           curl -s -X POST http://localhost:3000/rest/user/login \
             -H "Content-Type: application/json" \
             -d '{"email":"test@test.com","password":"test"}' || true
 
       - name: Get and prepare payloads
         run: |
-          # Скачиваем исходный список SQL-инъекций
           wget -q https://raw.githubusercontent.com/swisskyrepo/PayloadsAllTheThings/refs/heads/master/SQL%20Injection/Intruder/SQL-Injection -O sql-injection-raw.txt
-          
-          # Очищаем словарь: убираем комментарии, пустые строки и возможные пробелы в начале/конце
           grep -v '^#' sql-injection-raw.txt | sed '/^$/d' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' > sql-payloads.txt
-          
           echo "Подготовлено payload'ов: $(wc -l < sql-payloads.txt)"
           head -n 5 sql-payloads.txt
 
-      - name: Install ffuf
+      - name: Install ffuf (prebuilt binary)
         run: |
-          go install github.com/ffuf/ffuf/v2@latest
-          echo "$HOME/go/bin" >> $GITHUB_PATH
+          # Скачиваем готовый бинарник — не требуем Go на self-hosted раннере
+          FFUF_VER="v2.1.0"
+          wget -q "https://github.com/ffuf/ffuf/releases/download/${FFUF_VER}/ffuf_${FFUF_VER#v}_linux_amd64.tar.gz" -O ffuf.tar.gz
+          tar -xzf ffuf.tar.gz ffuf
+          chmod +x ffuf
+          ./ffuf -V
 
       - name: Run ffuf SQL injection fuzzing
         run: |
-          # Фаззим поле email в JSON-теле POST-запроса.
-          # Успешный вход в Juice Shop возвращает 200 и JSON с JWT (поле "authentication").
-          # Фильтруем ответы, содержащие сообщение об ошибке аутентификации.
-          ffuf -w sql-payloads.txt \
+          ./ffuf -w sql-payloads.txt \
             -u http://localhost:3000/rest/user/login \
             -X POST \
             -H "Content-Type: application/json" \
